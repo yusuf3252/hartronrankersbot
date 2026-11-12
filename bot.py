@@ -957,6 +957,45 @@ async def admin_reload(message: Message):
 
 
 @dp.message(Command("stats"))
+@dp.message(Command("cancel"))
+async def admin_cancel_subscription(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    parts = (message.text or "").split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        await message.answer(
+            "⚠️ Sahi format use karein:\n"
+            "<code>/cancel USER_ID</code>\n\n"
+            "Example: <code>/cancel 123456789</code>"
+        )
+        return
+
+    target_user_id = int(parts[1])
+    with connect_db() as con:
+        row = con.execute(
+            "SELECT full_name FROM users WHERE user_id=?",
+            (target_user_id,)
+        ).fetchone()
+        con.execute("DELETE FROM users WHERE user_id=?", (target_user_id,))
+
+    if row:
+        await message.answer(
+            f"🚫 <b>SUBSCRIPTION CANCELLED</b>\n\n"
+            f"Name: {row[0] or 'N/A'}\n"
+            f"User ID: <code>{target_user_id}</code>\n"
+            "Inka premium access ab band kar diya gaya hai."
+        )
+        try:
+            await bot.send_message(
+                target_user_id,
+                "⚠️ Aapka premium subscription cancel kar diya gaya hai. "
+                "Kisi bhi jaankari ke liye admin se sampark karein."
+            )
+        except Exception:
+            pass
+    else:
+        await message.answer(f"ℹ️ User ID <code>{target_user_id}</code> ka koi active subscription nahi mila.")
 async def admin_stats(message: Message):
     if message.from_user.id != ADMIN_ID:
         return
