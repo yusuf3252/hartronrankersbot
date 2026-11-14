@@ -26,12 +26,15 @@ ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "theStudentSupportZone")
 TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "hartron_deo_secret_99")
 
-MONTHLY_PLAN_PRICE = 149
+MONTHLY_PLAN_PRICE = 59
 MONTHLY_PLAN_DAYS = 30
-TWO_MONTH_PLAN_PRICE = 239
+TWO_MONTH_PLAN_PRICE = 99
 TWO_MONTH_PLAN_DAYS = 60
+THREE_MONTH_PLAN_PRICE = 129
+THREE_MONTH_PLAN_DAYS = 90
 
 QUESTIONS_PER_TEST = 30
+MIX_QUESTIONS_PER_TEST = 50
 DEFAULT_TIMER_SECONDS = 30
 EXCEL_FILE = "questions.xlsx"
 QR_IMAGE_FILE = "qr.jpg"
@@ -67,7 +70,8 @@ TOPIC_ALIASES = {
     "Word/Excel": ["word/xcl", "word", "excel", "spreadsheet"],
     "Networking": ["networking", "lan", "wan", "protocol", "network"],
 }
-TOPICS = list(TOPIC_ALIASES.keys())
+MIX_TOPIC_NAME = "Mix Questions"
+TOPICS = list(TOPIC_ALIASES.keys()) + [MIX_TOPIC_NAME]
 
 user_sessions = {}
 poll_to_user = {}
@@ -139,6 +143,11 @@ def get_expiry(user_id: int) -> Optional[datetime]:
 def is_subscribed(user_id: int) -> bool:
     expiry = get_expiry(user_id)
     return bool(expiry and datetime.now() < expiry)
+
+
+def can_access_test(user_id: int, test_no: int) -> bool:
+    """Test Series 1 is free for all users; all other tests require subscription."""
+    return test_no == 1 or is_subscribed(user_id)
 
 
 def activate_subscription(user_id: int, username: str, full_name: str, days: int):
@@ -238,6 +247,7 @@ def build_test_catalog(df):
     if df.empty:
         return catalog
 
+    # Subject-wise test series (30 questions per set unless test_no is given)
     for topic, aliases in TOPIC_ALIASES.items():
         pattern = "|".join(re.escape(x) for x in aliases)
         topic_df = df[
@@ -257,6 +267,14 @@ def build_test_catalog(df):
             for offset in range(0, len(records), QUESTIONS_PER_TEST):
                 number = offset // QUESTIONS_PER_TEST + 1
                 catalog[topic][number] = records[offset:offset + QUESTIONS_PER_TEST]
+
+    # Mix Questions test series (all topics mixed, 50 questions per set)
+    all_records = df.to_dict("records")
+    rng = random.Random(42)
+    rng.shuffle(all_records)
+    for offset in range(0, len(all_records), MIX_QUESTIONS_PER_TEST):
+        number = offset // MIX_QUESTIONS_PER_TEST + 1
+        catalog[MIX_TOPIC_NAME][number] = all_records[offset:offset + MIX_QUESTIONS_PER_TEST]
 
     return catalog
 
@@ -291,7 +309,8 @@ def topics_keyboard():
     rows = []
     for index, topic in enumerate(TOPICS):
         count = len(test_catalog.get(topic, {}))
-        rows.append([button(f"📚  {topic}  •  {count} TESTS", f"topic:{index}")])
+        icon = "🔀" if topic == MIX_TOPIC_NAME else "📚"
+        rows.append([button(f"{icon}  {topic}  •  {count} TESTS", f"topic:{index}")])
     rows.append([button("⬅️  MAIN MENU", "home:main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -299,13 +318,17 @@ def topics_keyboard():
 def tests_keyboard(topic_index: int, user_id: int):
     topic = TOPICS[topic_index]
     tests = test_catalog.get(topic, {})
+    subscribed = is_subscribed(user_id)
     rows = []
     for test_no in sorted(tests):
         score = get_best_score(user_id, topic, test_no)
-        if is_subscribed(user_id):
-            label = f"📝  TEST SERIES {test_no}  •  BEST {score:.0f}%"
+        q_count = len(tests[test_no])
+        if subscribed:
+            label = f"📝  TEST SERIES {test_no} ({q_count} Qs)  •  BEST {score:.0f}%"
+        elif test_no == 1:
+            label = f"🆓  TEST SERIES 1 ({q_count} Qs)  •  FREE DEMO"
         else:
-            label = f"🔒  TEST SERIES {test_no}  •  PREMIUM"
+            label = f"🔒  TEST SERIES {test_no} ({q_count} Qs)  •  PREMIUM"
         rows.append([button(label, f"test:{topic_index}:{test_no}")])
     if not rows:
         rows.append([button("⚠️  TESTS NOT AVAILABLE", "noop")])
@@ -336,7 +359,8 @@ def timer_keyboard(topic_index: int, test_no: int, practice=False):
 def plans_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [button(f"🥉  1 MONTH — ₹{MONTHLY_PLAN_PRICE}", f"plan:{MONTHLY_PLAN_DAYS}:{MONTHLY_PLAN_PRICE}")],
-        [button(f"🥈  2 MONTHS — ₹{TWO_MONTH_PLAN_PRICE} (SAVE ₹59)", f"plan:{TWO_MONTH_PLAN_DAYS}:{TWO_MONTH_PLAN_PRICE}")],
+        [button(f"🥈  2 MONTHS — ₹{TWO_MONTH_PLAN_PRICE} (SAVE ₹19)", f"plan:{TWO_MONTH_PLAN_DAYS}:{TWO_MONTH_PLAN_PRICE}")],
+        [button(f"🥇  3 MONTHS — ₹{THREE_MONTH_PLAN_PRICE} (BEST VALUE)", f"plan:{THREE_MONTH_PLAN_DAYS}:{THREE_MONTH_PLAN_PRICE}")],
         [button("⬅️  MAIN MENU", "home:main")],
     ])
 
@@ -353,7 +377,7 @@ def payment_review_keyboard(request_id: int, user_id: int):
 def premium_benefits():
     return (
         "💎 <b>PREMIUM MEMBERSHIP BENEFITS</b>\n\n"
-        "✅ Unlock every DEO subject and test series\n"
+        "✅ Unlock every DEO subject & 50-question Mix Test Series\n"
         "✅ Access 1,000+ questions (as your question bank grows)\n"
         "✅ Unlimited test attempts during membership\n"
         "✅ Topic-wise practice and CBT exam mode\n"
@@ -362,7 +386,7 @@ def premium_benefits():
         "✅ Personal best-score tracking\n"
         "✅ Retake tests to improve performance\n"
         "✅ New tests and questions can be added by admin\n"
-        "✅ 30-day or 60-day access options\n\n"
+        "✅ 30, 60, or 90-day access options\n\n"
         "<i>Question count depends on the questions uploaded by the admin.</i>"
     )
 
@@ -370,11 +394,9 @@ def premium_benefits():
 async def show_plans(message: Message):
     text = (
         "💎 <b>CHOOSE YOUR PREMIUM PLAN</b>\n\n"
-        f"🥉 <b>1 MONTH — ₹{MONTHLY_PLAN_PRICE}</b>\n"
-        "Access validity: 30 days\n\n"
-        f"🥈 <b>2 MONTHS — ₹{TWO_MONTH_PLAN_PRICE}</b>\n"
-        "Access validity: 60 days\n"
-        "Save ₹59 compared with two monthly renewals.\n\n"
+        f"🥉 <b>1 MONTH — ₹{MONTHLY_PLAN_PRICE}</b> (30 Days)\n"
+        f"🥈 <b>2 MONTHS — ₹{TWO_MONTH_PLAN_PRICE}</b> (60 Days • Save ₹19)\n"
+        f"🥇 <b>3 MONTHS — ₹{THREE_MONTH_PLAN_PRICE}</b> (90 Days • Save ₹48)\n\n"
         + premium_benefits()
         + "\n\nSelect a plan below to continue with payment."
     )
@@ -391,11 +413,10 @@ async def start_handler(message: Message):
     await message.answer(
         "🎓 <b>WELCOME TO HARTRON DEO PREMIUM CBT PORTAL</b>\n\n"
         "Your focused preparation platform for the Data Entry Operator exam.\n\n"
-        "📚 Subject-wise test series\n"
-        "🧠 1,000+ question learning bank as content is uploaded\n"
+        "🆓 <b>Test Series 1 is FREE</b> in every subject!\n"
+        "📚 Subject-wise & 50-question Mix test series\n"
         "⏱ Timed CBT examination\n"
-        "📊 Performance and score tracking\n"
-        "🔐 Premium access for all test series\n\n"
+        "📊 Performance and score tracking\n\n"
         "<b>Select an option to get started:</b>",
         reply_markup=home_keyboard()
     )
@@ -414,8 +435,8 @@ async def home_main(call: CallbackQuery):
 async def home_deo(call: CallbackQuery):
     await call.message.edit_text(
         "📚 <b>DATA ENTRY OPERATOR — SUBJECTS</b>\n\n"
-        "Choose a subject to view its available test series.\n"
-        "🔒 All test series require an active subscription.",
+        "Choose a subject (or Mix Questions) to start.\n"
+        "🆓 <b>Test Series 1 is FREE</b> for all students!",
         reply_markup=topics_keyboard()
     )
     await call.answer()
@@ -440,7 +461,7 @@ async def home_account(call: CallbackQuery):
     if active:
         status = f"🟢 ACTIVE — until <b>{expiry.strftime('%d %b %Y, %I:%M %p')}</b>"
     else:
-        status = "🔴 INACTIVE"
+        status = "🆓 FREE DEMO (Test Series 1 Unlocked)"
     await call.message.edit_text(
         "👤 <b>MY ACCOUNT</b>\n\n"
         f"Name: <b>{user.full_name}</b>\n"
@@ -495,8 +516,8 @@ async def select_topic(call: CallbackQuery):
         f"📂 <b>{topic.upper()}</b>\n\n"
         f"Available test series: <b>{count}</b>\n"
         "Select a test series below.\n\n"
-        + ("🟢 Subscription active — tests unlocked." if is_subscribed(call.from_user.id)
-           else "🔒 Premium membership is required to start any test."),
+        + ("🟢 Subscription active — all tests unlocked." if is_subscribed(call.from_user.id)
+           else "🆓 Test Series 1 is FREE! Subscribe to unlock Test Series 2 onwards."),
         reply_markup=tests_keyboard(topic_index, call.from_user.id)
     )
     await call.answer()
@@ -513,14 +534,15 @@ async def select_test(call: CallbackQuery):
         await call.answer("Test series not found.", show_alert=True)
         return
 
-    if not is_subscribed(call.from_user.id):
-        await call.answer("🔒 Premium subscription required to unlock all tests.", show_alert=True)
+    if not can_access_test(call.from_user.id, test_no):
+        await call.answer("🔒 Test Series 1 is free. Subscribe to unlock all remaining tests!", show_alert=True)
         await show_plans(call.message)
         return
 
     score = get_best_score(call.from_user.id, topic, test_no)
+    badge = " (FREE DEMO)" if (test_no == 1 and not is_subscribed(call.from_user.id)) else ""
     await call.message.edit_text(
-        f"📝 <b>{topic.upper()} — TEST SERIES {test_no}</b>\n\n"
+        f"📝 <b>{topic.upper()} — TEST SERIES {test_no}{badge}</b>\n\n"
         f"Questions in this test: <b>{len(questions)}</b>\n"
         f"Best score: <b>{score:.1f}%</b>\n"
         "Mode: Computer Based Test (CBT)\n\n"
@@ -532,11 +554,11 @@ async def select_test(call: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("practice:"))
 async def practice_mode(call: CallbackQuery):
-    if not is_subscribed(call.from_user.id):
-        await call.answer("🔒 Please subscribe to unlock practice tests.", show_alert=True)
+    _, topic_index, test_no = call.data.split(":")
+    if not can_access_test(call.from_user.id, int(test_no)):
+        await call.answer("🔒 Please subscribe to unlock this test.", show_alert=True)
         await show_plans(call.message)
         return
-    _, topic_index, test_no = call.data.split(":")
     await call.message.edit_text(
         "📘 <b>PRACTICE MODE SETTINGS</b>\n\nChoose time allowed per question:",
         reply_markup=timer_keyboard(int(topic_index), int(test_no), practice=True)
@@ -546,11 +568,11 @@ async def practice_mode(call: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("timer:"))
 async def exam_timer(call: CallbackQuery):
-    if not is_subscribed(call.from_user.id):
-        await call.answer("🔒 Please subscribe to unlock CBT exams.", show_alert=True)
+    _, topic_index, test_no = call.data.split(":")
+    if not can_access_test(call.from_user.id, int(test_no)):
+        await call.answer("🔒 Please subscribe to unlock this test.", show_alert=True)
         await show_plans(call.message)
         return
-    _, topic_index, test_no = call.data.split(":")
     await call.message.edit_text(
         "⏱ <b>CBT EXAM SETTINGS</b>\n\nSelect time allowed for each question:",
         reply_markup=timer_keyboard(int(topic_index), int(test_no), practice=False)
@@ -562,8 +584,8 @@ async def exam_timer(call: CallbackQuery):
 
 async def begin_test(message: Message, user_id: int, topic_index: int,
                      test_no: int, seconds: int, practice: bool):
-    if not is_subscribed(user_id):
-        await message.answer("🔒 An active premium subscription is required.")
+    if not can_access_test(user_id, test_no):
+        await message.answer("🔒 An active premium subscription is required for Test Series 2 onwards.")
         await show_plans(message)
         return
 
@@ -611,12 +633,12 @@ async def begin_test(message: Message, user_id: int, topic_index: int,
 @dp.callback_query(F.data.startswith("quizgo:"))
 @dp.callback_query(F.data.startswith("practicego:"))
 async def start_quiz_callback(call: CallbackQuery):
-    if not is_subscribed(call.from_user.id):
-        await call.answer("Subscription required.", show_alert=True)
-        await show_plans(call.message)
-        return
     try:
         mode, topic_index, test_no, seconds = call.data.split(":")
+        if not can_access_test(call.from_user.id, int(test_no)):
+            await call.answer("Subscription required.", show_alert=True)
+            await show_plans(call.message)
+            return
         await call.answer("Your test is starting...")
         try:
             await call.message.delete()
@@ -734,6 +756,16 @@ async def finish_test(user_id: int):
         else "KEEP PRACTICING 💪"
     )
 
+    extra_note = ""
+    buttons = [
+        [button("🔄  RETAKE TEST", f"test:{TOPICS.index(state['topic'])}:{state['test_no']}")],
+        [button("📚  ALL SUBJECTS", "home:deo")],
+        [button("🏠  MAIN MENU", "home:main")],
+    ]
+    if not is_subscribed(user_id):
+        extra_note = "\n\n🔓 <i>Want to unlock Test Series 2, 3, 4 & all Mix Tests? Upgrade to Premium!</i>"
+        buttons.insert(1, [button("💎  UNLOCK ALL TESTS (₹59)", "home:plans")])
+
     await bot.send_message(
         state["chat_id"],
         "🏁 <b>YOUR TEST RESULT</b>\n\n"
@@ -744,12 +776,8 @@ async def finish_test(user_id: int):
         f"Wrong / Skipped: <b>{wrong_or_skipped}</b>\n"
         f"Accuracy: <b>{percentage:.1f}%</b>\n"
         f"Performance: <b>{performance}</b>\n\n"
-        "Your result has been saved to My Account.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [button("🔄  RETAKE TEST", f"test:{TOPICS.index(state['topic'])}:{state['test_no']}")],
-            [button("📚  ALL SUBJECTS", "home:deo")],
-            [button("🏠  MAIN MENU", "home:main")],
-        ])
+        "Your result has been saved to My Account." + extra_note,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
     )
 
 
@@ -781,6 +809,7 @@ async def choose_plan(call: CallbackQuery):
     valid_plans = {
         (MONTHLY_PLAN_DAYS, MONTHLY_PLAN_PRICE),
         (TWO_MONTH_PLAN_DAYS, TWO_MONTH_PLAN_PRICE),
+        (THREE_MONTH_PLAN_DAYS, THREE_MONTH_PLAN_PRICE),
     }
     if (days, price) not in valid_plans:
         await call.answer("Plan not available.", show_alert=True)
@@ -957,6 +986,27 @@ async def admin_reload(message: Message):
 
 
 @dp.message(Command("stats"))
+async def admin_stats(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    with connect_db() as con:
+        users = con.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        pending = con.execute(
+            "SELECT COUNT(*) FROM payment_requests WHERE status='pending'"
+        ).fetchone()[0]
+        active = con.execute(
+            "SELECT COUNT(*) FROM users WHERE expiry_date > ?",
+            (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),)
+        ).fetchone()[0]
+    await message.answer(
+        "📊 <b>BOT ADMIN STATS</b>\n\n"
+        f"Registered members: {users}\n"
+        f"Active subscriptions: {active}\n"
+        f"Pending payments: {pending}\n"
+        f"Question bank rows: {len(QUESTION_DF)}"
+    )
+
+
 @dp.message(Command("cancel"))
 async def admin_cancel_subscription(message: Message):
     if message.from_user.id != ADMIN_ID:
@@ -996,25 +1046,6 @@ async def admin_cancel_subscription(message: Message):
             pass
     else:
         await message.answer(f"ℹ️ User ID <code>{target_user_id}</code> ka koi active subscription nahi mila.")
-async def admin_stats(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    with connect_db() as con:
-        users = con.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        pending = con.execute(
-            "SELECT COUNT(*) FROM payment_requests WHERE status='pending'"
-        ).fetchone()[0]
-        active = con.execute(
-            "SELECT COUNT(*) FROM users WHERE expiry_date > ?",
-            (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),)
-        ).fetchone()[0]
-    await message.answer(
-        "📊 <b>BOT ADMIN STATS</b>\n\n"
-        f"Registered members: {users}\n"
-        f"Active subscriptions: {active}\n"
-        f"Pending payments: {pending}\n"
-        f"Question bank rows: {len(QUESTION_DF)}"
-    )
 
 
 # ------------------------------- WEBHOOK & FASTAPI -------------------------------
