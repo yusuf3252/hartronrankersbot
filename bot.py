@@ -1,5 +1,7 @@
 import asyncio
+import csv
 import hmac
+import io
 import logging
 import os
 import random
@@ -14,8 +16,8 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
-    InlineKeyboardButton, InlineKeyboardMarkup, FSInputFile,
-    CallbackQuery, Message, PollAnswer, Update
+    BufferedInputFile, InlineKeyboardButton, InlineKeyboardMarkup,
+    FSInputFile, CallbackQuery, Message, PollAnswer, Update
 )
 from fastapi import FastAPI, Request, HTTPException
 
@@ -75,6 +77,8 @@ TOPICS = list(TOPIC_ALIASES.keys()) + [MIX_TOPIC_NAME]
 
 user_sessions = {}
 poll_to_user = {}
+daily_poll_to_user = {}
+last_wrong_answers = {}
 test_catalog = {}
 
 
@@ -118,11 +122,30 @@ def init_db():
                 created_at TEXT NOT NULL
             )
         """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS daily_attempts (
+                user_id INTEGER NOT NULL,
+                attempt_date TEXT NOT NULL,
+                PRIMARY KEY (user_id, attempt_date)
+            )
+        """)
         con.execute("CREATE INDEX IF NOT EXISTS idx_results_user ON results(user_id)")
 
         user_columns = {row[1] for row in con.execute("PRAGMA table_info(users)").fetchall()}
         if "full_name" not in user_columns:
             con.execute("ALTER TABLE users ADD COLUMN full_name TEXT")
+
+
+def register_user(user_id: int, username: str, full_name: str):
+    """Ensure every user who starts the bot is saved for broadcast & leaderboard."""
+    with connect_db() as con:
+        con.execute("""
+            INSERT INTO users(user_id, username, full_name, expiry_date)
+            VALUES(?,?,?,NULL)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username=excluded.username,
+                full_name=excluded.full_name
+        """, (user_id, username, full_name))
 
 
 def get_expiry(user_id: int) -> Optional[datetime]:
@@ -146,7 +169,6 @@ def is_subscribed(user_id: int) -> bool:
 
 
 def can_access_test(user_id: int, test_no: int) -> bool:
-    """Test Series 1 is free for all users; all other tests require subscription."""
     return test_no == 1 or is_subscribed(user_id)
 
 
@@ -247,7 +269,6 @@ def build_test_catalog(df):
     if df.empty:
         return catalog
 
-    # Subject-wise test series (30 questions per set unless test_no is given)
     for topic, aliases in TOPIC_ALIASES.items():
         pattern = "|".join(re.escape(x) for x in aliases)
         topic_df = df[
@@ -268,7 +289,6 @@ def build_test_catalog(df):
                 number = offset // QUESTIONS_PER_TEST + 1
                 catalog[topic][number] = records[offset:offset + QUESTIONS_PER_TEST]
 
-    # Mix Questions test series (all topics mixed, 50 questions per set)
     all_records = df.to_dict("records")
     rng = random.Random(42)
     rng.shuffle(all_records)
@@ -299,9 +319,15 @@ def button(label, callback_data):
 def home_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [button("👨‍💻  DATA ENTRY OPERATOR (DEO)", "home:deo")],
+        [
+            button("📅  DAILY QUIZ", "home:daily"),
+            button("🏆  TOP RANKERS", "home:rankers"),
+        ],
         [button("💎  SUBSCRIPTION PLANS", "home:plans")],
-        [button("👤  MY ACCOUNT", "home:account")],
-        [button("📞  CONTACT ADMIN", "home:contact")],
+        [
+            button("👤  MY ACCOUNT", "home:account"),
+            button("📞  SUPPORT", "home:contact"),
+        ],
     ])
 
 
@@ -378,16 +404,13 @@ def premium_benefits():
     return (
         "💎 <b>PREMIUM MEMBERSHIP BENEFITS</b>\n\n"
         "✅ Unlock every DEO subject & 50-question Mix Test Series\n"
-        "✅ Access 1,000+ questions (as your question bank grows)\n"
+        "✅ Access complete syllabus question bank\n"
         "✅ Unlimited test attempts during membership\n"
         "✅ Topic-wise practice and CBT exam mode\n"
         "✅ Choose 15, 20 or 30 seconds per question\n"
-        "✅ Instant score and accuracy report\n"
-        "✅ Personal best-score tracking\n"
-        "✅ Retake tests to improve performance\n"
-        "✅ New tests and questions can be added by admin\n"
-        "✅ 30, 60, or 90-day access options\n\n"
-        "<i>Question count depends on the questions uploaded by the admin.</i>"
+        "✅ Instant score, accuracy & wrong answer review\n"
+        "✅ Personal best-score & leaderboard ranking\n"
+        "✅ 30, 60, or 90-day access options"
     )
 
 
@@ -410,13 +433,15 @@ async def show_plans(message: Message):
 
 @dp.message(CommandStart())
 async def start_handler(message: Message):
+    user = message.from_user
+    register_user(user.id, user.username or "", user.full_name)
     await message.answer(
         "🎓 <b>WELCOME TO HARTRON DEO PREMIUM CBT PORTAL</b>\n\n"
         "Your focused preparation platform for the Data Entry Operator exam.\n\n"
         "🆓 <b>Test Series 1 is FREE</b> in every subject!\n"
+        "📅 Free Daily Question & Live Rankers Leaderboard\n"
         "📚 Subject-wise & 50-question Mix test series\n"
-        "⏱ Timed CBT examination\n"
-        "📊 Performance and score tracking\n\n"
+        "⏱ Timed CBT examination & wrong answer review\n\n"
         "<b>Select an option to get started:</b>",
         reply_markup=home_keyboard()
     )
@@ -448,9 +473,97 @@ async def home_plans(call: CallbackQuery):
     await call.answer()
 
 
+@dp.callback_query(F.data == "home:rankers")
+async def home_rankers(call: CallbackQuery):
+    with connect_db() as con:
+        rows = con.execute("""
+            SELECT u.full_name, SUM(r.score) as total_score, COUNT(r.result_id) as tests, ROUND(AVG(r.percentage), 1) as avg_acc
+            FROM results r
+            LEFT JOIN users u ON r.user_id = u.user_id
+            GROUP BY r.user_id
+            ORDER BY total_score DESC, avg_acc DESC
+            LIMIT 10
+        """).fetchall()
+
+    if not rows:
+        text = "🏆 <b>HARTRON TOP RANKERS</b>\n\nAbhi tak kisi ne test complete nahi kiya hai. Pehla test dekar #1 Rank haasil karein!"
+    else:
+        medals = ["🥇", "🥈", "🥉"]
+        lines = ["🏆 <b>HARTRON TOP 10 RANKERS</b>\n"]
+        for idx, (fname, t_score, t_count, avg_acc) in enumerate(rows, start=1):
+            badge = medals[idx - 1] if idx <= 3 else f"#{idx}"
+            name_display = (fname or "Student")[:22]
+            lines.append(f"{badge} <b>{name_display}</b> — {t_score} pts ({t_count} tests • {avg_acc}%)")
+        lines.append("\n<i>Zyada tests attempt karein aur Top 3 mein jagah banayein!</i>")
+        text = "\n".join(lines)
+
+    await call.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [button("🚀  START A TEST", "home:deo")],
+            [button("⬅️  MAIN MENU", "home:main")],
+        ])
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data == "home:daily")
+async def home_daily_quiz(call: CallbackQuery):
+    user = call.from_user
+    register_user(user.id, user.username or "", user.full_name)
+    today_str = datetime.now().strftime("%Y-%m-%d")
+
+    with connect_db() as con:
+        already = con.execute(
+            "SELECT 1 FROM daily_attempts WHERE user_id=? AND attempt_date=?",
+            (user.id, today_str)
+        ).fetchone()
+
+    if already:
+        await call.answer("Aap aaj ka Daily Quiz pehle hi attempt kar chuke hain! Kal phir aayein.", show_alert=True)
+        return
+
+    if QUESTION_DF.empty:
+        await call.answer("Questions available nahi hain.", show_alert=True)
+        return
+
+    # Pick a consistent daily question based on today's date
+    seed_val = int(datetime.now().strftime("%Y%m%d"))
+    row_idx = seed_val % len(QUESTION_DF)
+    row = QUESTION_DF.iloc[row_idx]
+
+    try:
+        correct_index = get_correct_index(row["ans"])
+    except Exception:
+        await call.answer("Technical error in daily question.", show_alert=True)
+        return
+
+    options = [str(row[f"opt_{n}"]).strip()[:100] for n in range(1, 5)]
+    question = str(row["question"]).strip()
+    subject_tag = str(row.get("questype", "Computer")).strip()
+
+    with connect_db() as con:
+        con.execute(
+            "INSERT OR IGNORE INTO daily_attempts(user_id, attempt_date) VALUES(?,?)",
+            (user.id, today_str)
+        )
+
+    poll_msg = await call.message.answer_poll(
+        question=f"📅 DAILY QUIZ ({subject_tag}): {question}"[:300],
+        options=options,
+        type="quiz",
+        correct_option_id=correct_index,
+        is_anonymous=False,
+        open_period=30,
+    )
+    daily_poll_to_user[poll_msg.poll.id] = (user.id, correct_index)
+    await call.answer("Aaj ka Daily Question bhej diya gaya hai!")
+
+
 @dp.callback_query(F.data == "home:account")
 async def home_account(call: CallbackQuery):
     user = call.from_user
+    register_user(user.id, user.username or "", user.full_name)
     expiry = get_expiry(user.id)
     active = bool(expiry and expiry > datetime.now())
     with connect_db() as con:
@@ -613,6 +726,7 @@ async def begin_test(message: Message, user_id: int, topic_index: int,
         "index": 0,
         "timer": seconds,
         "score": 0,
+        "wrong_list": [],
         "poll_id": None,
         "correct_option": None,
         "timeout_task": None,
@@ -709,10 +823,23 @@ async def send_next_question(user_id: int):
         await send_next_question(user_id)
 
 
+def record_wrong_question(state: dict, user_choice_text: str):
+    row = state["questions"][state["index"]]
+    correct_idx = state["correct_option"]
+    correct_text = str(row[f"opt_{correct_idx + 1}"]).strip()
+    state["wrong_list"].append({
+        "q_no": state["index"] + 1,
+        "question": str(row["question"]).strip(),
+        "your_ans": user_choice_text,
+        "correct_ans": correct_text,
+    })
+
+
 async def question_timeout(user_id: int, poll_id: str, seconds: int):
     await asyncio.sleep(seconds + 1)
     state = user_sessions.get(user_id)
     if state and state.get("poll_id") == poll_id:
+        record_wrong_question(state, "Skipped (Time Out)")
         poll_to_user.pop(poll_id, None)
         state["poll_id"] = None
         state["index"] += 1
@@ -721,6 +848,16 @@ async def question_timeout(user_id: int, poll_id: str, seconds: int):
 
 @dp.poll_answer()
 async def process_poll_answer(answer: PollAnswer):
+    # Handle Daily Quiz poll answers first
+    if answer.poll_id in daily_poll_to_user:
+        uid, correct_idx = daily_poll_to_user.pop(answer.poll_id)
+        selected = answer.option_ids[0] if answer.option_ids else None
+        if selected == correct_idx:
+            await bot.send_message(uid, "🎉 <b>Sahi Jawab!</b> Kal phir naye Daily Question ke liye aayein.")
+        else:
+            await bot.send_message(uid, "❌ <b>Galat Jawab!</b> Koi baat nahi, kal phir try karein ya Full Test Series practice karein.")
+        return
+
     user_id = poll_to_user.get(answer.poll_id)
     state = user_sessions.get(user_id) if user_id else None
     if not state or state.get("poll_id") != answer.poll_id:
@@ -733,6 +870,10 @@ async def process_poll_answer(answer: PollAnswer):
     selected = answer.option_ids[0] if answer.option_ids else None
     if selected == state["correct_option"]:
         state["score"] += 1
+    else:
+        row = state["questions"][state["index"]]
+        chosen_text = str(row[f"opt_{selected + 1}"]).strip() if selected is not None else "Skipped"
+        record_wrong_question(state, chosen_text)
 
     poll_to_user.pop(answer.poll_id, None)
     state["poll_id"] = None
@@ -750,6 +891,8 @@ async def finish_test(user_id: int):
     score = state["score"]
     wrong_or_skipped = total - score
     percentage = save_result(user_id, state["topic"], state["test_no"], score, total)
+    last_wrong_answers[user_id] = state["wrong_list"]
+
     performance = (
         "EXCELLENT 🏆" if percentage >= 75
         else "GOOD 👍" if percentage >= 50
@@ -762,6 +905,9 @@ async def finish_test(user_id: int):
         [button("📚  ALL SUBJECTS", "home:deo")],
         [button("🏠  MAIN MENU", "home:main")],
     ]
+    if state["wrong_list"]:
+        buttons.insert(0, [button(f"❌  REVIEW WRONG ANSWERS ({len(state['wrong_list'])})", "review:wrong")])
+
     if not is_subscribed(user_id):
         extra_note = "\n\n🔓 <i>Want to unlock Test Series 2, 3, 4 & all Mix Tests? Upgrade to Premium!</i>"
         buttons.insert(1, [button("💎  UNLOCK ALL TESTS (₹59)", "home:plans")])
@@ -779,6 +925,33 @@ async def finish_test(user_id: int):
         "Your result has been saved to My Account." + extra_note,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
     )
+
+
+@dp.callback_query(F.data == "review:wrong")
+async def review_wrong_answers(call: CallbackQuery):
+    wrong_items = last_wrong_answers.get(call.from_user.id, [])
+    if not wrong_items:
+        await call.answer("Is test mein aapka koi bhi sawal galat nahi hua!", show_alert=True)
+        return
+
+    chunks = []
+    current_msg = "❌ <b>WRONG / SKIPPED QUESTIONS REVIEW</b>\n\n"
+    for item in wrong_items:
+        block = (
+            f"<b>Q{item['q_no']}.</b> {item['question']}\n"
+            f"   🔸 Your Answer: <i>{item['your_ans']}</i>\n"
+            f"   ✅ Correct Answer: <b>{item['correct_ans']}</b>\n\n"
+        )
+        if len(current_msg) + len(block) > 3800:
+            chunks.append(current_msg)
+            current_msg = block
+        else:
+            current_msg += block
+    chunks.append(current_msg)
+
+    for text_part in chunks:
+        await call.message.answer(text_part)
+    await call.answer()
 
 
 @dp.message(Command("stop"))
@@ -816,6 +989,7 @@ async def choose_plan(call: CallbackQuery):
         return
 
     user = call.from_user
+    register_user(user.id, user.username or "", user.full_name)
     with connect_db() as con:
         cursor = con.execute("""
             INSERT INTO payment_requests(user_id, username, full_name, plan_days, plan_price, status, created_at)
@@ -1000,11 +1174,88 @@ async def admin_stats(message: Message):
         ).fetchone()[0]
     await message.answer(
         "📊 <b>BOT ADMIN STATS</b>\n\n"
-        f"Registered members: {users}\n"
-        f"Active subscriptions: {active}\n"
+        f"Total registered users: {users}\n"
+        f"Active paid subscriptions: {active}\n"
         f"Pending payments: {pending}\n"
         f"Question bank rows: {len(QUESTION_DF)}"
     )
+
+
+@dp.message(Command("users"))
+async def admin_list_users(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with connect_db() as con:
+        rows = con.execute(
+            "SELECT user_id, username, full_name, expiry_date FROM users WHERE expiry_date > ? ORDER BY expiry_date DESC",
+            (now_str,)
+        ).fetchall()
+
+    if not rows:
+        await message.answer("ℹ️ Abhi kisi bhi student ka active subscription nahi hai.")
+        return
+
+    lines = ["👥 <b>ACTIVE PAID SUBSCRIBERS</b>\n"]
+    for idx, (uid, uname, fname, exp) in enumerate(rows, start=1):
+        u_tag = f"@{uname}" if uname else "No username"
+        lines.append(
+            f"{idx}. <b>{fname or 'Student'}</b> ({u_tag})\n"
+            f"   ID: <code>{uid}</code> | Valid till: <b>{exp[:10]}</b>"
+        )
+    await message.answer("\n".join(lines))
+
+
+@dp.message(Command("approve"))
+async def admin_manual_approve(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    parts = (message.text or "").split()
+    if len(parts) < 3 or not parts[1].isdigit() or not parts[2].isdigit():
+        await message.answer(
+            "⚠️ Sahi format use karein:\n"
+            "<code>/approve USER_ID DAYS</code>\n\n"
+            "Example (1 month ke liye):\n"
+            "<code>/approve 123456789 30</code>"
+        )
+        return
+
+    target_user_id = int(parts[1])
+    days = int(parts[2])
+
+    with connect_db() as con:
+        req = con.execute(
+            "SELECT username, full_name FROM payment_requests WHERE user_id=? ORDER BY request_id DESC LIMIT 1",
+            (target_user_id,)
+        ).fetchone()
+        usr = con.execute(
+            "SELECT username, full_name FROM users WHERE user_id=?",
+            (target_user_id,)
+        ).fetchone()
+
+    username = (req[0] if req else None) or (usr[0] if usr else "") or ""
+    full_name = (req[1] if req else None) or (usr[1] if usr else "Student") or "Student"
+
+    expiry = activate_subscription(target_user_id, username, full_name, days)
+    await message.answer(
+        f"✅ <b>MANUAL APPROVAL SUCCESSFUL</b>\n\n"
+        f"Name: <b>{full_name}</b>\n"
+        f"User ID: <code>{target_user_id}</code>\n"
+        f"Plan: <b>{days} days</b>\n"
+        f"Valid until: <b>{expiry.strftime('%d %b %Y, %I:%M %p')}</b>"
+    )
+    try:
+        await bot.send_message(
+            target_user_id,
+            "🎉 <b>PREMIUM SUBSCRIPTION ACTIVATED!</b>\n\n"
+            f"Plan: <b>{days} days</b>\n"
+            f"Valid until: <b>{expiry.strftime('%d %b %Y, %I:%M %p')}</b>\n\n"
+            "All available DEO test series are now unlocked.\n"
+            "Send /start to begin your preparation."
+        )
+    except Exception:
+        log.warning("Could not DM user %s after manual approval", target_user_id)
 
 
 @dp.message(Command("cancel"))
@@ -1027,7 +1278,7 @@ async def admin_cancel_subscription(message: Message):
             "SELECT full_name FROM users WHERE user_id=?",
             (target_user_id,)
         ).fetchone()
-        con.execute("DELETE FROM users WHERE user_id=?", (target_user_id,))
+        con.execute("UPDATE users SET expiry_date=NULL WHERE user_id=?", (target_user_id,))
 
     if row:
         await message.answer(
@@ -1046,6 +1297,103 @@ async def admin_cancel_subscription(message: Message):
             pass
     else:
         await message.answer(f"ℹ️ User ID <code>{target_user_id}</code> ka koi active subscription nahi mila.")
+
+
+@dp.message(Command("broadcast"))
+async def admin_broadcast(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    text_to_send = (message.text or "").partition(" ")[2].strip()
+    if not text_to_send:
+        await message.answer(
+            "⚠️ Sahi format use karein:\n"
+            "<code>/broadcast Aapka message yahan likhein</code>"
+        )
+        return
+
+    with connect_db() as con:
+        user_ids = [r[0] for r in con.execute("SELECT user_id FROM users").fetchall()]
+
+    sent = 0
+    failed = 0
+    status_msg = await message.answer(f"📢 {len(user_ids)} students ko message bheja ja raha hai...")
+
+    for uid in user_ids:
+        try:
+            await bot.send_message(uid, f"📢 <b>HARTRON RANKERS UPDATE</b>\n\n{text_to_send}")
+            sent += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            failed += 1
+
+    await status_msg.edit_text(
+        f"✅ <b>BROADCAST COMPLETE</b>\n\n"
+        f"Delivered: <b>{sent}</b>\n"
+        f"Failed (Blocked bot): <b>{failed}</b>"
+    )
+
+
+@dp.message(Command("remind"))
+async def admin_expiry_reminders(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    now = datetime.now()
+    three_days_later = (now + timedelta(days=3)).strftime("%Y-%m-%d %H:%M:%S")
+    now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+
+    with connect_db() as con:
+        rows = con.execute(
+            "SELECT user_id, full_name, expiry_date FROM users WHERE expiry_date > ? AND expiry_date <= ?",
+            (now_str, three_days_later)
+        ).fetchall()
+
+    if not rows:
+        await message.answer("ℹ️ Agle 3 din mein kisi bhi student ka subscription expire nahi ho raha hai.")
+        return
+
+    sent = 0
+    for uid, fname, exp in rows:
+        try:
+            await bot.send_message(
+                uid,
+                f"⏰ <b>SUBSCRIPTION EXPIRY REMINDER</b>\n\n"
+                f"Namaste <b>{fname or 'Student'}</b>,\n"
+                f"Aapka Hartron Rankers Premium Plan <b>{exp[:10]}</b> ko expire hone wala hai.\n\n"
+                "Bina kisi rukawat ke apni practice jaari rakhne ke liye abhi renew karein!",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [button("💎  RENEW NOW", "home:plans")]
+                ])
+            )
+            sent += 1
+        except Exception:
+            pass
+
+    await message.answer(f"✅ {sent} students ko renewal reminder bhej diya gaya hai.")
+
+
+@dp.message(Command("backup"))
+async def admin_backup_csv(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    with connect_db() as con:
+        rows = con.execute(
+            "SELECT user_id, username, full_name, expiry_date FROM users ORDER BY expiry_date DESC"
+        ).fetchall()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["user_id", "username", "full_name", "expiry_date"])
+    writer.writerows(rows)
+
+    csv_bytes = output.getvalue().encode("utf-8")
+    filename = f"hartron_users_backup_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+    await message.answer_document(
+        BufferedInputFile(csv_bytes, filename=filename),
+        caption=f"💾 <b>DATABASE BACKUP</b>\nTotal Users: {len(rows)}\n\nIs file ko safe rakhein!"
+    )
 
 
 # ------------------------------- WEBHOOK & FASTAPI -------------------------------
