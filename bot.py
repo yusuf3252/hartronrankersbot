@@ -79,7 +79,32 @@ user_sessions = {}
 poll_to_user = {}
 daily_poll_to_user = {}
 last_wrong_answers = {}
+last_bot_menu_msg = {}
 test_catalog = {}
+
+
+# ------------------------------- HELPERS -------------------------------
+
+async def safe_delete(chat_id: int, message_id: Optional[int]):
+    if not message_id:
+        return
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        pass
+
+
+async def send_clean_menu(chat_id: int, user_id: int, text: str, reply_markup=None, photo_path: Optional[str] = None):
+    """Deletes previous menu message for the user before sending a new one."""
+    old_msg_id = last_bot_menu_msg.pop(user_id, None)
+    await safe_delete(chat_id, old_msg_id)
+
+    if photo_path and os.path.isfile(photo_path):
+        sent = await bot.send_photo(chat_id=chat_id, photo=FSInputFile(photo_path), caption=text, reply_markup=reply_markup)
+    else:
+        sent = await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
+    last_bot_menu_msg[user_id] = sent.message_id
+    return sent
 
 
 # ------------------------------- DATABASE -------------------------------
@@ -137,7 +162,6 @@ def init_db():
 
 
 def register_user(user_id: int, username: str, full_name: str):
-    """Ensure every user who starts the bot is saved for broadcast & leaderboard."""
     with connect_db() as con:
         con.execute("""
             INSERT INTO users(user_id, username, full_name, expiry_date)
@@ -414,7 +438,7 @@ def premium_benefits():
     )
 
 
-async def show_plans(message: Message):
+async def show_plans(chat_id: int, user_id: int):
     text = (
         "💎 <b>CHOOSE YOUR PREMIUM PLAN</b>\n\n"
         f"🥉 <b>1 MONTH — ₹{MONTHLY_PLAN_PRICE}</b> (30 Days)\n"
@@ -423,10 +447,19 @@ async def show_plans(message: Message):
         + premium_benefits()
         + "\n\nSelect a plan below to continue with payment."
     )
-    if os.path.isfile(QR_PATH):
-        await message.answer_photo(FSInputFile(QR_PATH), caption=text, reply_markup=plans_keyboard())
-    else:
-        await message.answer(text, reply_markup=plans_keyboard())
+    await send_clean_menu(chat_id, user_id, text, reply_markup=plans_keyboard(), photo_path=QR_PATH)
+
+
+def main_menu_text():
+    return (
+        "🎓 <b>WELCOME TO HARTRON DEO PREMIUM CBT PORTAL</b>\n\n"
+        "Your focused preparation platform for the Data Entry Operator exam.\n\n"
+        "🆓 <b>Test Series 1 is FREE</b> in every subject!\n"
+        "📅 Free Daily Question & Live Rankers Leaderboard\n"
+        "📚 Subject-wise & 50-question Mix test series\n"
+        "⏱ Timed CBT examination & wrong answer review\n\n"
+        "<b>Select an option to get started:</b>"
+    )
 
 
 # ------------------------------- START & HOME MENU -------------------------------
@@ -435,41 +468,37 @@ async def show_plans(message: Message):
 async def start_handler(message: Message):
     user = message.from_user
     register_user(user.id, user.username or "", user.full_name)
-    await message.answer(
-        "🎓 <b>WELCOME TO HARTRON DEO PREMIUM CBT PORTAL</b>\n\n"
-        "Your focused preparation platform for the Data Entry Operator exam.\n\n"
-        "🆓 <b>Test Series 1 is FREE</b> in every subject!\n"
-        "📅 Free Daily Question & Live Rankers Leaderboard\n"
-        "📚 Subject-wise & 50-question Mix test series\n"
-        "⏱ Timed CBT examination & wrong answer review\n\n"
-        "<b>Select an option to get started:</b>",
-        reply_markup=home_keyboard()
-    )
+    await safe_delete(message.chat.id, message.message_id)
+    await send_clean_menu(message.chat.id, user.id, main_menu_text(), reply_markup=home_keyboard())
 
 
 @dp.callback_query(F.data == "home:main")
 async def home_main(call: CallbackQuery):
-    await call.message.answer(
-        "🎓 <b>HARTRON DEO PREMIUM CBT PORTAL</b>\n\nSelect an option:",
-        reply_markup=home_keyboard()
-    )
+    await safe_delete(call.message.chat.id, call.message.message_id)
+    await send_clean_menu(call.message.chat.id, call.from_user.id, main_menu_text(), reply_markup=home_keyboard())
     await call.answer()
 
 
 @dp.callback_query(F.data == "home:deo")
 async def home_deo(call: CallbackQuery):
-    await call.message.edit_text(
+    text = (
         "📚 <b>DATA ENTRY OPERATOR — SUBJECTS</b>\n\n"
         "Choose a subject (or Mix Questions) to start.\n"
-        "🆓 <b>Test Series 1 is FREE</b> for all students!",
-        reply_markup=topics_keyboard()
+        "🆓 <b>Test Series 1 is FREE</b> for all students!"
     )
+    if call.message.photo:
+        await safe_delete(call.message.chat.id, call.message.message_id)
+        await send_clean_menu(call.message.chat.id, call.from_user.id, text, reply_markup=topics_keyboard())
+    else:
+        await call.message.edit_text(text, reply_markup=topics_keyboard())
+        last_bot_menu_msg[call.from_user.id] = call.message.message_id
     await call.answer()
 
 
 @dp.callback_query(F.data == "home:plans")
 async def home_plans(call: CallbackQuery):
-    await show_plans(call.message)
+    await safe_delete(call.message.chat.id, call.message.message_id)
+    await show_plans(call.message.chat.id, call.from_user.id)
     await call.answer()
 
 
@@ -504,6 +533,7 @@ async def home_rankers(call: CallbackQuery):
             [button("⬅️  MAIN MENU", "home:main")],
         ])
     )
+    last_bot_menu_msg[call.from_user.id] = call.message.message_id
     await call.answer()
 
 
@@ -527,7 +557,6 @@ async def home_daily_quiz(call: CallbackQuery):
         await call.answer("Questions available nahi hain.", show_alert=True)
         return
 
-    # Pick a consistent daily question based on today's date
     seed_val = int(datetime.now().strftime("%Y%m%d"))
     row_idx = seed_val % len(QUESTION_DF)
     row = QUESTION_DF.iloc[row_idx]
@@ -556,7 +585,7 @@ async def home_daily_quiz(call: CallbackQuery):
         is_anonymous=False,
         open_period=30,
     )
-    daily_poll_to_user[poll_msg.poll.id] = (user.id, correct_index)
+    daily_poll_to_user[poll_msg.poll.id] = (user.id, correct_index, poll_msg.message_id)
     await call.answer("Aaj ka Daily Question bhej diya gaya hai!")
 
 
@@ -587,6 +616,7 @@ async def home_account(call: CallbackQuery):
             [button("⬅️  MAIN MENU", "home:main")],
         ])
     )
+    last_bot_menu_msg[call.from_user.id] = call.message.message_id
     await call.answer()
 
 
@@ -605,6 +635,7 @@ async def home_contact(call: CallbackQuery):
         "For subscription, payment verification or technical assistance, contact the administrator.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
     )
+    last_bot_menu_msg[call.from_user.id] = call.message.message_id
     await call.answer()
 
 
@@ -633,6 +664,7 @@ async def select_topic(call: CallbackQuery):
            else "🆓 Test Series 1 is FREE! Subscribe to unlock Test Series 2 onwards."),
         reply_markup=tests_keyboard(topic_index, call.from_user.id)
     )
+    last_bot_menu_msg[call.from_user.id] = call.message.message_id
     await call.answer()
 
 
@@ -649,7 +681,8 @@ async def select_test(call: CallbackQuery):
 
     if not can_access_test(call.from_user.id, test_no):
         await call.answer("🔒 Test Series 1 is free. Subscribe to unlock all remaining tests!", show_alert=True)
-        await show_plans(call.message)
+        await safe_delete(call.message.chat.id, call.message.message_id)
+        await show_plans(call.message.chat.id, call.from_user.id)
         return
 
     score = get_best_score(call.from_user.id, topic, test_no)
@@ -662,6 +695,7 @@ async def select_test(call: CallbackQuery):
         "Choose your test mode:",
         reply_markup=test_detail_keyboard(topic_index, test_no)
     )
+    last_bot_menu_msg[call.from_user.id] = call.message.message_id
     await call.answer()
 
 
@@ -670,12 +704,14 @@ async def practice_mode(call: CallbackQuery):
     _, topic_index, test_no = call.data.split(":")
     if not can_access_test(call.from_user.id, int(test_no)):
         await call.answer("🔒 Please subscribe to unlock this test.", show_alert=True)
-        await show_plans(call.message)
+        await safe_delete(call.message.chat.id, call.message.message_id)
+        await show_plans(call.message.chat.id, call.from_user.id)
         return
     await call.message.edit_text(
         "📘 <b>PRACTICE MODE SETTINGS</b>\n\nChoose time allowed per question:",
         reply_markup=timer_keyboard(int(topic_index), int(test_no), practice=True)
     )
+    last_bot_menu_msg[call.from_user.id] = call.message.message_id
     await call.answer()
 
 
@@ -684,28 +720,29 @@ async def exam_timer(call: CallbackQuery):
     _, topic_index, test_no = call.data.split(":")
     if not can_access_test(call.from_user.id, int(test_no)):
         await call.answer("🔒 Please subscribe to unlock this test.", show_alert=True)
-        await show_plans(call.message)
+        await safe_delete(call.message.chat.id, call.message.message_id)
+        await show_plans(call.message.chat.id, call.from_user.id)
         return
     await call.message.edit_text(
         "⏱ <b>CBT EXAM SETTINGS</b>\n\nSelect time allowed for each question:",
         reply_markup=timer_keyboard(int(topic_index), int(test_no), practice=False)
     )
+    last_bot_menu_msg[call.from_user.id] = call.message.message_id
     await call.answer()
 
 
 # ------------------------------- QUIZ ENGINE -------------------------------
 
-async def begin_test(message: Message, user_id: int, topic_index: int,
+async def begin_test(chat_id: int, user_id: int, topic_index: int,
                      test_no: int, seconds: int, practice: bool):
     if not can_access_test(user_id, test_no):
-        await message.answer("🔒 An active premium subscription is required for Test Series 2 onwards.")
-        await show_plans(message)
+        await show_plans(chat_id, user_id)
         return
 
     topic = TOPICS[topic_index]
     questions = test_catalog.get(topic, {}).get(test_no, [])
     if not questions:
-        await message.answer("This test has no questions yet. Please contact admin.")
+        await bot.send_message(chat_id, "This test has no questions yet. Please contact admin.")
         return
 
     old = user_sessions.get(user_id)
@@ -713,13 +750,26 @@ async def begin_test(message: Message, user_id: int, topic_index: int,
         old["timeout_task"].cancel()
     if old and old.get("poll_id"):
         poll_to_user.pop(old["poll_id"], None)
+    if old and old.get("last_poll_msg_id"):
+        await safe_delete(chat_id, old["last_poll_msg_id"])
 
     chosen = list(questions)
     if SHUFFLE_QUESTIONS:
         random.shuffle(chosen)
 
+    intro_msg = await bot.send_message(
+        chat_id,
+        f"🚀 <b>TEST STARTED</b>\n\n"
+        f"Subject: <b>{topic}</b>\n"
+        f"Test Series: <b>{test_no}</b>\n"
+        f"Questions: <b>{len(chosen)}</b>\n"
+        f"Time: <b>{seconds} seconds/question</b>\n"
+        f"Mode: <b>{'Practice' if practice else 'CBT Exam'}</b>\n\n"
+        "First question loading..."
+    )
+
     user_sessions[user_id] = {
-        "chat_id": message.chat.id,
+        "chat_id": chat_id,
         "topic": topic,
         "test_no": test_no,
         "questions": chosen,
@@ -728,19 +778,12 @@ async def begin_test(message: Message, user_id: int, topic_index: int,
         "score": 0,
         "wrong_list": [],
         "poll_id": None,
+        "last_poll_msg_id": intro_msg.message_id,
         "correct_option": None,
         "timeout_task": None,
         "practice": practice,
     }
-    await message.answer(
-        f"🚀 <b>TEST STARTED</b>\n\n"
-        f"Subject: <b>{topic}</b>\n"
-        f"Test Series: <b>{test_no}</b>\n"
-        f"Questions: <b>{len(chosen)}</b>\n"
-        f"Time: <b>{seconds} seconds/question</b>\n"
-        f"Mode: <b>{'Practice' if practice else 'CBT Exam'}</b>\n\n"
-        "Answer each question before the timer ends. Good luck!"
-    )
+    await asyncio.sleep(1.5)
     await send_next_question(user_id)
 
 
@@ -751,15 +794,14 @@ async def start_quiz_callback(call: CallbackQuery):
         mode, topic_index, test_no, seconds = call.data.split(":")
         if not can_access_test(call.from_user.id, int(test_no)):
             await call.answer("Subscription required.", show_alert=True)
-            await show_plans(call.message)
+            await safe_delete(call.message.chat.id, call.message.message_id)
+            await show_plans(call.message.chat.id, call.from_user.id)
             return
         await call.answer("Your test is starting...")
-        try:
-            await call.message.delete()
-        except Exception:
-            pass
+        await safe_delete(call.message.chat.id, call.message.message_id)
+        last_bot_menu_msg.pop(call.from_user.id, None)
         await begin_test(
-            call.message, call.from_user.id,
+            call.message.chat.id, call.from_user.id,
             int(topic_index), int(test_no), int(seconds),
             mode == "practicego"
         )
@@ -782,6 +824,11 @@ async def send_next_question(user_id: int):
     state = user_sessions.get(user_id)
     if not state:
         return
+
+    # Delete previous question poll or intro message to keep chat clean
+    if state.get("last_poll_msg_id"):
+        await safe_delete(state["chat_id"], state["last_poll_msg_id"])
+        state["last_poll_msg_id"] = None
 
     index = state["index"]
     questions = state["questions"]
@@ -812,6 +859,7 @@ async def send_next_question(user_id: int):
         )
         poll_id = poll_message.poll.id
         state["poll_id"] = poll_id
+        state["last_poll_msg_id"] = poll_message.message_id
         state["correct_option"] = correct_index
         poll_to_user[poll_id] = user_id
         state["timeout_task"] = asyncio.create_task(
@@ -848,9 +896,10 @@ async def question_timeout(user_id: int, poll_id: str, seconds: int):
 
 @dp.poll_answer()
 async def process_poll_answer(answer: PollAnswer):
-    # Handle Daily Quiz poll answers first
     if answer.poll_id in daily_poll_to_user:
-        uid, correct_idx = daily_poll_to_user.pop(answer.poll_id)
+        uid, correct_idx, poll_msg_id = daily_poll_to_user.pop(answer.poll_id)
+        await asyncio.sleep(1.2)
+        await safe_delete(uid, poll_msg_id)
         selected = answer.option_ids[0] if answer.option_ids else None
         if selected == correct_idx:
             await bot.send_message(uid, "🎉 <b>Sahi Jawab!</b> Kal phir naye Daily Question ke liye aayein.")
@@ -912,7 +961,7 @@ async def finish_test(user_id: int):
         extra_note = "\n\n🔓 <i>Want to unlock Test Series 2, 3, 4 & all Mix Tests? Upgrade to Premium!</i>"
         buttons.insert(1, [button("💎  UNLOCK ALL TESTS (₹59)", "home:plans")])
 
-    await bot.send_message(
+    res_msg = await bot.send_message(
         state["chat_id"],
         "🏁 <b>YOUR TEST RESULT</b>\n\n"
         f"Subject: <b>{state['topic']}</b>\n"
@@ -925,6 +974,7 @@ async def finish_test(user_id: int):
         "Your result has been saved to My Account." + extra_note,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
     )
+    last_bot_menu_msg[user_id] = res_msg.message_id
 
 
 @dp.callback_query(F.data == "review:wrong")
@@ -956,6 +1006,7 @@ async def review_wrong_answers(call: CallbackQuery):
 
 @dp.message(Command("stop"))
 async def stop_test(message: Message):
+    await safe_delete(message.chat.id, message.message_id)
     state = user_sessions.pop(message.from_user.id, None)
     if state:
         task = state.get("timeout_task")
@@ -963,9 +1014,21 @@ async def stop_test(message: Message):
             task.cancel()
         if state.get("poll_id"):
             poll_to_user.pop(state["poll_id"], None)
-        await message.answer("⏹ Test stopped. Your partial score was not saved.")
+        if state.get("last_poll_msg_id"):
+            await safe_delete(state["chat_id"], state["last_poll_msg_id"])
+        await send_clean_menu(
+            message.chat.id,
+            message.from_user.id,
+            "⏹ Test stopped. Your partial score was not saved.",
+            reply_markup=home_keyboard()
+        )
     else:
-        await message.answer("You do not have an active test.")
+        await send_clean_menu(
+            message.chat.id,
+            message.from_user.id,
+            "You do not have an active test.",
+            reply_markup=home_keyboard()
+        )
 
 
 # ------------------------------- SUBSCRIPTION / PAYMENT -------------------------------
